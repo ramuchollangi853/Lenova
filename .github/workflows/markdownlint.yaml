@@ -1,0 +1,241 @@
+name: Build
+
+on:
+  push:
+    # branches: [main]
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  id-token: write
+  contents: write
+  actions: read
+  checks: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_NAME: titanium-facade-service
+  GO_VERSION: '1.25.3'
+  GOIMPORTS_VERSION: 'v0.38.0'
+  BUF_VERSION: 'v1.58.0'
+  PROTOC_GEN_GO_VERSION: 'v1.36.10'
+  PROTOC_GEN_GO_GRPC_VERSION: 'v1.5.1'
+  GOLANGCI_LINT_VERSION: 'v2.5.0'
+
+jobs:
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install tools
+        run: |
+          go install golang.org/x/tools/cmd/goimports@${{ env.GOIMPORTS_VERSION }}
+          go install github.com/bufbuild/buf/cmd/buf@${{ env.BUF_VERSION }}
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@${{ env.PROTOC_GEN_GO_VERSION }}
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@${{ env.PROTOC_GEN_GO_GRPC_VERSION }}
+      - name: Verify buf format
+        run: buf format --exit-code
+
+      - name: Run buf lint
+        run: buf lint
+
+      - name: Run buf generate
+        run: buf generate
+
+      - name: Check goimports
+        run: |
+          UNFORMATTED=$(find . -type f -name '*.go' \
+          -not -path './vendor/*' \
+          -not -path './api/*' \
+          -exec goimports -l {} +)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+      - name: Check go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install tools
+        run: |
+          go install golang.org/x/tools/cmd/goimports@${{ env.GOIMPORTS_VERSION }}
+          go install github.com/bufbuild/buf/cmd/buf@${{ env.BUF_VERSION }}
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@${{ env.PROTOC_GEN_GO_VERSION }}
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@${{ env.PROTOC_GEN_GO_GRPC_VERSION }}
+      - name: Run buf generate
+        run: buf generate
+
+      - name: Run tests and generate reports
+        run: |
+          go install github.com/jstemmer/go-junit-report/v2@latest
+          PACKAGES=$(go list ./... | grep -v '/api/' | grep -v '/internal/config$')
+          go test $PACKAGES \
+            -v \
+            -timeout 10m \
+            -coverprofile=coverage.out \
+            2>&1 | go-junit-report > test-results.xml
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: coverage-report
+          path: coverage.out
+
+      - name: Upload test results artifact
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: test-results
+          path: test-results.xml
+
+      - name: Test Report
+        uses: dorny/test-reporter@a43b3a5f7366b97d083190328d2c652e1a8b6aa2 #v3
+        if: always()
+        with:
+          name: Go Tests
+          path: test-results.xml
+          reporter: java-junit
+
+      - name: Convert Coverage
+        if: always()
+        run: |
+          go install github.com/boumenot/gocover-cobertura@latest
+          gocover-cobertura < coverage.out > coverage.xml
+      - name: Coverage Report
+        if: always()
+        uses: irongut/CodeCoverageSummary@51cc3a756ddcd398d447c044c02cb6aa83fdae95 # v1.3.0
+        with:
+          filename: coverage.xml
+          format: markdown
+          output: both
+
+      - name: Extract Coverage %
+        id: coverage
+        run: |
+          TOTAL=$(go tool cover -func=coverage.out | tail -n 1 | awk '{print $3}' | sed 's/%//')
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+      - name: Enforce Coverage Threshold
+        run: |
+          MIN_THRESHOLD=1%
+          TOTAL=${{ steps.coverage.outputs.total }}
+          if [ "$(awk "BEGIN {print ($TOTAL < $MIN_THRESHOLD) ? 1 : 0}")" = "1" ]; then
+            echo "❌ Coverage below minimum threshold (${MIN_THRESHOLD}%)"
+            exit 1
+          else
+            echo "✅ Coverage meets minimum threshold"
+          fi
+      - name: Publish Coverage Summary
+        run: |
+          TOTAL="${{ steps.coverage.outputs.total }}"
+          if [ "$(awk "BEGIN {print ($TOTAL < 50) ? 1 : 0}")" = "1" ]; then
+            RISK="🔴 High Risk"
+          elif [ "$(awk "BEGIN {print ($TOTAL < 70) ? 1 : 0}")" = "1" ]; then
+            RISK="🟡 Medium Risk"
+          else
+            RISK="🟢 Low Risk"
+          fi
+          echo "## 📊 Code Coverage Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Total Coverage | ${TOTAL}% |" >> $GITHUB_STEP_SUMMARY
+          echo "| Minimum Required | 30% |" >> $GITHUB_STEP_SUMMARY
+          echo "| Risk Level | $RISK |" >> $GITHUB_STEP_SUMMARY
+      - name: Add Coverage PR Comment
+        uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0 # v3.0.4
+        if: github.event_name == 'pull_request'
+        with:
+          message: |
+            📊 **Code Coverage:** ${{ steps.coverage.outputs.total }}%
+            🔎 Full report available in workflow artifacts
+  build:
+    runs-on: [self-hosted, linux, x64]
+    environment: azt001
+    needs: [lint, test]
+
+    outputs:
+      image_tag: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install tools
+        run: |
+          go install golang.org/x/tools/cmd/goimports@${{ env.GOIMPORTS_VERSION }}
+          go install github.com/bufbuild/buf/cmd/buf@${{ env.BUF_VERSION }}
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@${{ env.PROTOC_GEN_GO_VERSION }}
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@${{ env.PROTOC_GEN_GO_GRPC_VERSION }}
+      - name: Run buf generate
+        run: buf generate
+
+      - name: Build Go binary
+        run: |
+          CGO_ENABLED=0 GOOS=linux go build \
+            -o bin/${{ env.APP_NAME }} ./cmd/grpc-server
+      - name: Calculate version
+        id: version
+        run: echo "version=$(date -u +'%Y%m%d').${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Azure Login
+        # if: github.ref == 'refs/heads/main'
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43  #v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to ACR
+        # if: github.ref == 'refs/heads/main'
+        run: az acr login --name protect
+
+      - name: Cache busybox base image in ACR
+        # if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: |
+          az acr import --name protect \
+            --source docker.io/library/busybox:1.37 \
+            --image cache/busybox:1.37 --force
+      - name: Set up Docker Buildx
+        # if: github.ref == 'refs/heads/main'
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          driver: docker-container
+
+      - name: Build and push Docker image
+        # if: github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        with:
+          context: .
+          push: true
+          tags: |
+           
