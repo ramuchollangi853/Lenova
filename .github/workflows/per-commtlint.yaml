@@ -1,0 +1,58 @@
+name: Per-Commit Validation
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.25.3'
+
+jobs:
+
+  validate:
+    name: Validate each commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Validate each commit builds and tests pass
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          COMMITS=$(git rev-list --reverse "${BASE}..${HEAD}")
+          TOTAL=$(echo "$COMMITS" | wc -l | tr -d ' ')
+          CURRENT=0
+          for SHA in $COMMITS; do
+            CURRENT=$((CURRENT + 1))
+            SHORT=$(git rev-parse --short "$SHA")
+            SUBJECT=$(git log -1 --format='%s' "$SHA")
+            echo ""
+            echo "============================================"
+            echo "[$CURRENT/$TOTAL] $SHORT: $SUBJECT"
+            echo "============================================"
+            git checkout --quiet "$SHA"
+            echo "--- go build ---"
+            PACKAGES=$(go list ./... | grep -v '/api/' | grep -v '/internal/config$')
+            CGO_ENABLED=0 go build $PACKAGES
+            echo "--- go test ---"
+            go test $PACKAGES -timeout 10m
+            echo "[$CURRENT/$TOTAL] $SHORT passed"
+          done
+          echo ""
+          echo "============================================"
+          echo "All $TOTAL commits validated successfully"
+          echo "============================================"
+name: Validate each commit builds and tests pass
